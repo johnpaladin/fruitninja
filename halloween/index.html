@@ -94,7 +94,10 @@
   #receipt .thanks { text-align: center; margin-top: 12px; font-size: 13px; }
 </style>
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
 </script>
 </head>
 <body>
@@ -148,6 +151,10 @@
 
 <script type="module">
 import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 // ---------- renderer / scene ----------
 const canvas = document.getElementById('c');
@@ -156,14 +163,22 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.15;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x07040b);
 scene.fog = new THREE.FogExp2(0x100818, 0.028);
 const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.05, 120);
 camera.rotation.order = 'YXZ';
+const composer = new EffectComposer(renderer);
+composer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.45, 0.5, 0.9);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
 });
 
 const H = 4.6, X0 = -15, X1 = 15, Z0 = -24, Z1 = 15;
@@ -870,52 +885,315 @@ function buildWerewolf(stage) {
     dur: 5
   };
 }
-// --- 5. Pumpkin scarecrow ---
+// --- 5. Pumpkin scarecrow (detailed) ---
+// Tube whose radius can vary along its length and around it (for sleeves, legs, stems)
+function taperTube(curve, rFn, tSeg = 40, rSeg = 18) {
+  const frames = curve.computeFrenetFrames(tSeg, false);
+  const pos = [], uv = [], idx = [];
+  const P = new THREE.Vector3(), d = new THREE.Vector3();
+  for (let i = 0; i <= tSeg; i++) {
+    const u = i / tSeg; curve.getPointAt(u, P);
+    const Nn = frames.normals[i], Bn = frames.binormals[i];
+    for (let j = 0; j <= rSeg; j++) {
+      const v = j / rSeg * PI * 2, r = rFn(u, v);
+      d.copy(Nn).multiplyScalar(Math.cos(v)).addScaledVector(Bn, Math.sin(v));
+      pos.push(P.x + d.x * r, P.y + d.y * r, P.z + d.z * r); uv.push(j / rSeg, u);
+    }
+  }
+  for (let i = 0; i < tSeg; i++) for (let j = 0; j < rSeg; j++) {
+    const a = i * (rSeg + 1) + j, b = a + rSeg + 1;
+    idx.push(a, b, a + 1, b, b + 1, a + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals(); return g;
+}
+const curve3 = pts => new THREE.CatmullRomCurve3(pts.map(p => new THREE.Vector3(...p)));
+function noiseCanvas(g, w, h, n, alpha) {
+  for (let i = 0; i < n; i++) { g.fillStyle = `rgba(${Math.random() < .5 ? '0,0,0' : '255,255,255'},${Math.random() * alpha})`; g.fillRect(Math.random() * w, Math.random() * h, rand(1, 3), rand(1, 3)); }
+}
+const strawTex = canvasTex(256, 256, (g, w, h) => {
+  g.fillStyle = '#b08a3e'; g.fillRect(0, 0, w, h);
+  for (let i = 0; i < 900; i++) {
+    const x = Math.random() * w, y = Math.random() * h, l = rand(10, 40);
+    g.strokeStyle = `hsl(${rand(38, 48)},${rand(45, 70)}%,${rand(30, 62)}%)`; g.lineWidth = rand(1, 2.5);
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + l, y + rand(-3, 3)); g.stroke();
+  }
+});
+strawTex.wrapS = strawTex.wrapT = THREE.RepeatWrapping;
+// pumpkin: ribbed, flattened sphere; optional carved face (mask pushes vertices inward + glow map)
+function pumpkinGeo(seg, mask) {
+  const g = new THREE.SphereGeometry(1, seg, (seg * 0.75) | 0);
+  const p = g.attributes.position, uvA = g.attributes.uv;
+  let md = null, mw = 0, mh = 0;
+  if (mask) {
+    // blurred copy so the carved cut slopes smoothly instead of producing spikes
+    mw = mask.width; mh = mask.height;
+    const bc = document.createElement('canvas'); bc.width = mw; bc.height = mh;
+    const bg = bc.getContext('2d'); bg.filter = 'blur(6px)'; bg.drawImage(mask, 0, 0);
+    md = bg.getImageData(0, 0, mw, mh).data;
+  }
+  const lump = rand(0, 6);
+  for (let i = 0; i < p.count; i++) {
+    let x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const phi = Math.atan2(z, -x), ay = Math.abs(y);
+    let r = 0.9 + 0.1 * Math.pow(Math.abs(Math.cos(5 * phi)), 0.45) + 0.03 * Math.sin(phi * 3 + lump) * (1 - ay);
+    let ny = Math.sign(y) * (ay * 0.82 - 0.2 * smooth((ay - 0.82) / 0.18));
+    if (md) {
+      const u = uvA.getX(i), v = uvA.getY(i);
+      const px = Math.min(mw - 1, (u * mw) | 0), py = Math.min(mh - 1, ((1 - v) * mh) | 0);
+      r *= 1 - 0.12 * smooth(md[(py * mw + px) * 4] / 255 * 1.4);
+    }
+    p.setXYZ(i, x * r, ny * r, z * r);
+  }
+  g.computeVertexNormals(); return g;
+}
+function pumpkinTextures(face) {
+  const W = 1024, Hh = 512;
+  const mask = document.createElement('canvas'); mask.width = W; mask.height = Hh;
+  if (face) {
+    const g = mask.getContext('2d'); g.fillStyle = '#000'; g.fillRect(0, 0, W, Hh); g.fillStyle = '#fff';
+    const cx = W * 0.25, cy = Hh * 0.5;
+    const tri = (a, b, c) => { g.beginPath(); g.moveTo(...a); g.lineTo(...b); g.lineTo(...c); g.closePath(); g.fill(); };
+    tri([cx - 105, cy - 22], [cx - 30, cy - 22], [cx - 62, cy - 92]);
+    tri([cx + 105, cy - 22], [cx + 30, cy - 22], [cx + 62, cy - 92]);
+    tri([cx - 16, cy + 12], [cx + 16, cy + 12], [cx, cy - 16]);
+    g.beginPath(); g.moveTo(cx - 140, cy + 30);
+    g.quadraticCurveTo(cx, cy + 75, cx + 140, cy + 30);
+    g.quadraticCurveTo(cx, cy + 150, cx - 140, cy + 30); g.fill();
+    g.fillStyle = '#000';
+    g.fillRect(cx - 55, cy + 42, 26, 26); g.fillRect(cx + 30, cy + 42, 26, 26); g.fillRect(cx - 12, cy + 88, 24, 30);
+  }
+  const color = canvasTex(W, Hh, (g) => {
+    for (let x = 0; x < W; x += 2) {
+      const ph = x / W * PI * 2, rib = Math.pow(Math.abs(Math.cos(5 * ph)), 0.6);
+      g.fillStyle = `hsl(${24 + rib * 4},${88 + rib * 8}%,${30 + rib * 22}%)`; g.fillRect(x, 0, 2, Hh);
+    }
+    for (let i = 0; i < 260; i++) { g.strokeStyle = `rgba(255,210,120,${rand(0.03, 0.12)})`; g.lineWidth = rand(1, 3); const x = rand(0, W); g.beginPath(); g.moveTo(x, rand(40, 120)); g.lineTo(x + rand(-6, 6), rand(380, 470)); g.stroke(); }
+    const gr = g.createLinearGradient(0, 0, 0, Hh);
+    gr.addColorStop(0, 'rgba(70,60,10,.85)'); gr.addColorStop(.12, 'rgba(70,60,10,0)'); gr.addColorStop(.88, 'rgba(60,30,0,0)'); gr.addColorStop(1, 'rgba(60,30,0,.7)');
+    g.fillStyle = gr; g.fillRect(0, 0, W, Hh);
+    noiseCanvas(g, W, Hh, 4000, 0.15);
+    if (face) { g.globalCompositeOperation = 'lighter'; g.filter = 'blur(2px)'; g.drawImage(mask, 0, 0); }
+  });
+  let emissive = null;
+  if (face) emissive = canvasTex(W, Hh, (g) => { g.filter = 'blur(3px)'; g.drawImage(mask, 0, 0); g.filter = 'none'; g.globalCompositeOperation = 'multiply'; g.fillStyle = '#ffb040'; g.fillRect(0, 0, W, Hh); });
+  return { color, emissive, mask: face ? mask : null };
+}
+function addStraw(parent, origin, dir, count, spread, len) {
+  const geo = new THREE.ConeGeometry(0.006, 1, 3, 1); geo.translate(0, 0.5, 0);
+  const m = new THREE.InstancedMesh(geo, M(0xffffff, 0.9), count);
+  const up = new THREE.Vector3(0, 1, 0), D = new THREE.Vector3(...dir).normalize(), q = new THREE.Quaternion();
+  for (let i = 0; i < count; i++) {
+    const v = D.clone().add(new THREE.Vector3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(spread)).normalize();
+    q.setFromUnitVectors(up, v);
+    dummy.position.set(origin[0] + rand(-0.04, 0.04), origin[1] + rand(-0.04, 0.04), origin[2] + rand(-0.04, 0.04));
+    dummy.quaternion.copy(q); const l = rand(len[0], len[1]); dummy.scale.set(rand(0.7, 1.4), l, rand(0.7, 1.4)); dummy.updateMatrix();
+    m.setMatrixAt(i, dummy.matrix); m.setColorAt(i, new THREE.Color().setHSL(rand(0.1, 0.14), rand(0.45, 0.7), rand(0.35, 0.62)));
+  }
+  parent.add(m); return m;
+}
+function buildCrow() {
+  const crow = new THREE.Group();
+  const feather = M(0x0e0e14, 0.35, 0.25);
+  add(crow, new THREE.SphereGeometry(1, 16, 12), feather, 0, 0, 0).scale.set(0.065, 0.07, 0.13);
+  const head = group(crow, 0, 0.06, 0.1);
+  add(head, new THREE.SphereGeometry(0.048, 14, 10), feather);
+  const beak = add(head, new THREE.ConeGeometry(0.018, 0.08, 8), M(0x1c1c1c, 0.3, 0.3), 0, -0.008, 0.07); beak.rotation.x = PI / 2;
+  const ceye = B(0xff2020);
+  for (const s of [-1, 1]) add(head, new THREE.SphereGeometry(0.009, 6, 4), ceye, s * 0.032, 0.012, 0.03);
+  const tail = add(crow, new THREE.BoxGeometry(0.08, 0.01, 0.12), feather, 0, 0.0, -0.16); tail.rotation.x = -0.35;
+  const wings = [];
+  for (const s of [-1, 1]) {
+    const w = group(crow, s * 0.05, 0.03, 0);
+    add(w, new THREE.SphereGeometry(1, 10, 6), feather, s * 0.09, 0, -0.02).scale.set(0.11, 0.012, 0.075);
+    wings.push(w);
+  }
+  for (const s of [-1, 1]) add(crow, new THREE.CylinderGeometry(0.004, 0.004, 0.06), M(0x333333), s * 0.025, -0.08, 0.02);
+  return { crow, head, wings, ceye };
+}
 function buildScarecrow(stage) {
   const rig = group(stage);
-  const wood = M(0x5a3a1c, 0.95), straw = M(0xd9b44a, 1);
-  add(stage, new THREE.CylinderGeometry(0.06, 0.07, 2.6), wood, 0, 1.3, -0.25);
-  const body = group(rig, 0, 0, 0);
-  const shirt = M(0xffffff, 0.9, 0, { map: plaidTex() });
-  add(body, new THREE.BoxGeometry(0.62, 0.75, 0.32), shirt, 0, 1.65, 0);
-  add(body, new THREE.BoxGeometry(0.58, 0.55, 0.3), M(0x3a4a6a, 0.95), 0, 1.03, 0);
-  for (const s of [-1, 1]) {
-    add(body, new THREE.CylinderGeometry(0.12, 0.1, 0.55), M(0x3a4a6a, 0.95), s * 0.15, 0.5, 0);
-    for (let i = 0; i < 4; i++) { const c = add(body, new THREE.ConeGeometry(0.03, 0.18, 4), straw, s * 0.15 + rand(-0.06, 0.06), 0.16, rand(-0.05, 0.05)); c.rotation.x = PI + rand(-0.4, 0.4); }
-  }
+  // wooden post + crossbar
+  const barkTex = canvasTex(128, 512, (g, w, h) => {
+    g.fillStyle = '#4a3018'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 70; i++) { g.strokeStyle = `rgba(${rand(10, 40)},${rand(5, 20)},0,${rand(.3, .8)})`; g.lineWidth = rand(1, 4); const x = rand(0, w); g.beginPath(); g.moveTo(x, 0); g.bezierCurveTo(x + rand(-8, 8), h * .3, x + rand(-8, 8), h * .6, x + rand(-5, 5), h); g.stroke(); }
+    noiseCanvas(g, w, h, 1500, 0.2);
+  });
+  const wood = M(0xffffff, 0.95, 0, { map: barkTex, bumpMap: barkTex, bumpScale: 2 });
+  add(stage, new THREE.CylinderGeometry(0.055, 0.07, 2.75, 12), wood, 0, 1.37, -0.02);
+  const bar = add(stage, new THREE.CylinderGeometry(0.045, 0.045, 2.25, 10), wood, 0, 1.92, -0.02); bar.rotation.z = PI / 2;
+  // fabric textures
+  const plaid = canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = '#6e1616'; g.fillRect(0, 0, w, h);
+    const band = (c, a, sz, off) => { g.fillStyle = c; g.globalAlpha = a; for (let i = 0; i < 4; i++) { g.fillRect(i * 64 + off, 0, sz, h); g.fillRect(0, i * 64 + off, w, sz); } };
+    band('#1d0b0b', .55, 22, 8); band('#d9b46a', .45, 3, 40); band('#0e2a1a', .4, 8, 52);
+    g.globalAlpha = 1;
+    for (let y = 0; y < h; y += 2) { g.fillStyle = `rgba(0,0,0,${y % 4 ? .06 : .12})`; g.fillRect(0, y, w, 1); }
+    noiseCanvas(g, w, h, 2500, 0.18);
+    // burlap patch with stitches
+    g.fillStyle = '#8c7348'; g.fillRect(150, 150, 70, 60);
+    for (let i = 0; i < 300; i++) { g.fillStyle = `rgba(60,40,20,${rand(.2, .5)})`; g.fillRect(rand(150, 220), rand(150, 210), 2, 2); }
+    g.strokeStyle = '#e8dcc0'; g.lineWidth = 2; g.setLineDash([5, 4]); g.strokeRect(154, 154, 62, 52);
+  });
+  plaid.wrapS = plaid.wrapT = THREE.RepeatWrapping;
+  const fabricBump = canvasTex(128, 128, (g, w, h) => { g.fillStyle = '#888'; g.fillRect(0, 0, w, h); for (let y = 0; y < h; y += 2) { g.fillStyle = y % 4 ? '#777' : '#999'; g.fillRect(0, y, w, 1); } noiseCanvas(g, w, h, 1500, .4); });
+  fabricBump.wrapS = fabricBump.wrapT = THREE.RepeatWrapping; fabricBump.repeat.set(4, 4);
+  const shirt = M(0xffffff, 0.92, 0, { map: plaid, bumpMap: fabricBump, bumpScale: 1.2, side: THREE.DoubleSide });
+  const denimTex = canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = '#2c3d5c'; g.fillRect(0, 0, w, h);
+    g.strokeStyle = 'rgba(255,255,255,.07)'; g.lineWidth = 1;
+    for (let i = -h; i < w; i += 3) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i + h, h); g.stroke(); }
+    noiseCanvas(g, w, h, 3000, 0.2);
+    g.fillStyle = '#7a3b1e'; g.fillRect(30, 90, 60, 70);
+    g.strokeStyle = '#f0e0b0'; g.lineWidth = 2; g.setLineDash([5, 4]); g.strokeRect(34, 94, 52, 62);
+  });
+  const denimTex2 = denimTex.clone(); denimTex2.offset.set(0.5, 0.3); denimTex2.wrapS = denimTex2.wrapT = THREE.RepeatWrapping; denimTex.wrapS = denimTex.wrapT = THREE.RepeatWrapping;
+  const denim = M(0xffffff, 0.95, 0, { map: denimTex, bumpMap: fabricBump, bumpScale: 1 });
+  const denim2 = M(0xffffff, 0.95, 0, { map: denimTex2, bumpMap: fabricBump, bumpScale: 1 });
+  const rope = M(0xa58450, 0.95, 0, { map: strawTex });
+  const burlap = M(0xffffff, 1, 0, { map: strawTex, color: 0xc9b088 });
+
+  // torso: lathe profile, flattened front-to-back, with cloth wrinkles
+  const body = group(rig, 0, 1.3, 0);
+  const prof = [[0.26, -0.04], [0.27, 0.12], [0.31, 0.38], [0.33, 0.56], [0.3, 0.68], [0.2, 0.78], [0.1, 0.83]].map(([r, y]) => new THREE.Vector2(r, y));
+  const torsoGeo = new THREE.LatheGeometry(prof, 40);
+  { const p = torsoGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i), y = p.getY(i), z = p.getZ(i), a = Math.atan2(z, x);
+      const w = 1 + 0.04 * Math.sin(a * 7 + y * 9) + 0.03 * Math.sin(a * 13 - y * 21);
+      p.setXYZ(i, x * w, y, z * w * 0.62);
+    } torsoGeo.computeVertexNormals(); }
+  add(body, torsoGeo, shirt);
+  for (let i = 0; i < 4; i++) add(body, new THREE.CylinderGeometry(0.016, 0.016, 0.01, 10), M(0xe8dcc0, 0.4), 0, 0.1 + i * 0.15, 0.215 - Math.max(0, i - 2) * 0.01).rotation.x = PI / 2;
+  for (const s of [-1, 1]) { const c = add(body, new THREE.BoxGeometry(0.16, 0.012, 0.12), shirt, s * 0.08, 0.8, 0.09); c.rotation.set(0.6, s * 0.4, s * 0.5); }
+  const belt = add(body, new THREE.TorusGeometry(0.265, 0.022, 8, 40), rope, 0, 0.0, 0); belt.rotation.x = PI / 2; belt.scale.set(1, 0.62, 1);
+  add(body, new THREE.TorusKnotGeometry(0.025, 0.012, 32, 6), rope, 0.06, -0.02, 0.17);
+  addStraw(body, [0, 0.83, 0], [0, 1, 0.2], 50, 0.9, [0.08, 0.2]);
+  addStraw(body, [0.08, -0.02, 0.15], [0.2, -1, 0.5], 18, 0.5, [0.08, 0.18]);
+  // neck sack
+  const neck = add(body, new THREE.CylinderGeometry(0.09, 0.13, 0.18, 16), burlap, 0, 0.88, 0);
+  const neckRope = add(body, new THREE.TorusGeometry(0.1, 0.016, 6, 24), rope, 0, 0.9, 0); neckRope.rotation.x = PI / 2;
+
+  // arms (sleeves along the crossbar)
   const arms = [];
   for (const s of [-1, 1]) {
-    const a = group(body, s * 0.3, 1.9, 0);
-    const sl = add(a, new THREE.CylinderGeometry(0.1, 0.12, 0.8), shirt, s * 0.4, 0, 0); sl.rotation.z = PI / 2;
-    for (let i = 0; i < 5; i++) { const c = add(a, new THREE.ConeGeometry(0.03, 0.2, 4), straw, s * 0.88, rand(-0.06, 0.06), rand(-0.06, 0.06)); c.rotation.z = s * -PI / 2 + rand(-0.5, 0.5); }
+    const a = group(rig, s * 0.25, 1.92, 0);
+    const c = curve3([[0, 0, 0], [s * 0.35, 0.015, 0.01], [s * 0.78, -0.02, 0.02]]);
+    const sleeve = add(a, taperTube(c, (u, v) => {
+      const base = 0.115 - 0.02 * Math.sin(u * PI) + 0.03 * smooth((u - 0.8) / 0.2);
+      return base * (1 + 0.08 * Math.sin(u * 30 + v * 2) * (0.4 + u) + 0.05 * Math.sin(v * 5 + u * 12));
+    }, 48, 20), shirt);
+    const tie = add(a, new THREE.TorusGeometry(0.1, 0.015, 6, 24), rope, s * 0.66, -0.01, 0.02); tie.rotation.y = PI / 2;
+    addStraw(a, [s * 0.8, -0.02, 0.02], [s, -0.3, 0], 70, 0.55, [0.12, 0.3]);
     arms.push(a);
   }
-  add(stage, new THREE.CylinderGeometry(0.05, 0.05, 2.0), wood, 0, 1.9, -0.25).rotation.z = PI / 2;
-  const head = group(rig, 0, 2.38, 0);
-  const pk = M(0xff7a1a, 0.55, 0, { emissive: 0x401200 });
-  add(head, new THREE.SphereGeometry(0.34, 20, 14), pk).scale.set(1.18, 0.88, 1.1);
-  for (let i = 0; i < 8; i++) { const r = add(head, new THREE.TorusGeometry(0.3, 0.02, 4, 20), pk); r.rotation.y = i / 8 * PI; r.scale.set(1.3, 1, 1.3); }
-  add(head, new THREE.CylinderGeometry(0.04, 0.06, 0.16), M(0x2f5a1a), 0, 0.33, 0).rotation.z = 0.3;
-  const glow = B(0xffb000);
-  const triGeo = new THREE.CircleGeometry(0.08, 3);
-  for (const s of [-1, 1]) { const e = add(head, triGeo, glow, s * 0.13, 0.08, 0.372); e.rotation.z = PI / 2; }
-  for (let i = 0; i < 5; i++) { const m = add(head, new THREE.CircleGeometry(0.05, 3), glow, (i - 2) * 0.07, -0.12 + Math.abs(i - 2) * 0.02, 0.365); m.rotation.z = i % 2 ? PI / 2 : -PI / 2; }
-  const hat = group(head, 0, 0.3, 0); hat.rotation.z = -0.2;
-  add(hat, new THREE.CylinderGeometry(0.55, 0.6, 0.04, 18), M(0xa88450, 1));
-  add(hat, new THREE.ConeGeometry(0.28, 0.5, 14), M(0xa88450, 1), 0, 0.25, 0);
-  const inner = new THREE.PointLight(0xff8a00, 0, 3, 1.5); head.add(inner);
+  // pelvis + legs, dangling a bit above the ground
+  add(rig, new THREE.LatheGeometry([[0.2, 1.05], [0.26, 1.15], [0.27, 1.3], [0.26, 1.34]].map(([r, y]) => new THREE.Vector2(r, y)), 32), denim).scale.z = 0.62;
+  const legs = [];
+  for (const [i, s] of [[0, -1], [1, 1]]) {
+    const L = group(rig, s * 0.12, 1.12, 0);
+    const c = curve3([[0, 0, 0], [s * 0.01, -0.35, 0.04], [0, -0.75, 0.01]]);
+    add(L, taperTube(c, (u, v) => {
+      const base = 0.12 - 0.015 * u;
+      return base * (1 + 0.1 * Math.sin(u * 26 + v * 3) * smooth((u - 0.5) / 0.5) + 0.04 * Math.sin(v * 4 + u * 8));
+    }, 40, 18), i ? denim2 : denim);
+    addStraw(L, [0, -0.77, 0.01], [0, -1, 0.1], 55, 0.45, [0.12, 0.28]);
+    legs.push(L);
+  }
+
+  // head: carved jack-o'-lantern
+  const headPivot = group(rig, 0, 2.17, 0);
+  const head = group(headPivot, 0, 0.27, 0);
+  const pt = pumpkinTextures(true);
+  const faceMat = M(0xffffff, 0.55, 0, { map: pt.color, emissive: 0xffffff, emissiveMap: pt.emissive, emissiveIntensity: 1 });
+  const pk = add(head, pumpkinGeo(192, pt.mask), faceMat); pk.scale.set(0.38, 0.36, 0.38);
+  const stemC = curve3([[0, 0.24, 0], [0.01, 0.31, 0], [0.04, 0.37, 0.01], [0.09, 0.4, 0.02]]);
+  const stemMat = M(0x4a5a22, 0.85, 0, { map: barkTex, color: 0x9aa860 });
+  add(head, taperTube(stemC, (u, v) => (0.045 - 0.025 * u) * (1 + 0.18 * Math.cos(v * 6))), stemMat);
+  const vine = new THREE.CatmullRomCurve3(Array.from({ length: 30 }, (_, i) => { const a = i * 0.5; return new THREE.Vector3(0.03 + Math.cos(a) * 0.04 * (1 + i / 20), 0.31 + i * 0.004, Math.sin(a) * 0.04 * (1 + i / 20)); }));
+  add(head, new THREE.TubeGeometry(vine, 80, 0.005, 5), stemMat);
+  const inner = new THREE.PointLight(0xff8a00, 0.5, 3.5, 1.5); inner.position.set(0, 0, 0.22); head.add(inner);
+
+  // straw hat: lathe with drooping, uneven brim
+  const hatProf = [[0.001, 0.36], [0.1, 0.355], [0.17, 0.33], [0.2, 0.26], [0.21, 0.14], [0.22, 0.05], [0.26, 0.03], [0.4, 0.005], [0.54, -0.035], [0.6, -0.07]].map(([r, y]) => new THREE.Vector2(r, y));
+  const hatGeo = new THREE.LatheGeometry(hatProf, 64);
+  { const p = hatGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i), y = p.getY(i), z = p.getZ(i), r = Math.hypot(x, z), a = Math.atan2(z, x);
+      let ny = y;
+      if (r > 0.25) ny -= (r - 0.25) * (0.35 * Math.max(0, Math.sin(a)) + 0.1) + 0.008 * Math.sin(a * 9);
+      if (y > 0.3) ny -= 0.05 * Math.max(0, Math.cos(a - PI / 2)) * smooth(1 - r / 0.15);
+      const jag = r > 0.5 ? 1 + 0.012 * Math.sin(a * 23) : 1;
+      p.setXYZ(i, x * jag, ny, z * jag);
+    } hatGeo.computeVertexNormals(); }
+  const hatTex = strawTex.clone(); hatTex.repeat.set(8, 2);
+  const hat = group(head, 0.03, 0.18, -0.02); hat.rotation.set(-0.12, 0, -0.18);
+  add(hat, hatGeo, M(0xffffff, 0.95, 0, { map: hatTex, bumpMap: hatTex, bumpScale: 2, side: THREE.DoubleSide, color: 0xd8bf84 }));
+  add(hat, new THREE.CylinderGeometry(0.215, 0.222, 0.05, 40, 1, true), M(0x4a1010, 0.8, 0, { side: THREE.DoubleSide }), 0, 0.075, 0);
+  addStraw(hat, [0.45, -0.06, 0.3], [0.6, -0.4, 0.7], 26, 0.5, [0.06, 0.14]);
+  addStraw(hat, [-0.5, -0.03, -0.1], [-1, -0.2, -0.2], 18, 0.5, [0.05, 0.12]);
+
+  // crow perched on the left arm
+  const C = buildCrow(); stage.add(C.crow);
+  const perch = new THREE.Vector3(-0.72, 2.12, 0.02);
+  C.crow.position.copy(perch); C.crow.rotation.y = 0.6; C.crow.scale.setScalar(1.7);
+
+  // set dressing: hay bale + small pumpkins
+  const baleTex = strawTex.clone(); baleTex.repeat.set(2, 1);
+  const bale = add(stage, new THREE.BoxGeometry(0.9, 0.42, 0.5, 6, 3, 3), M(0xffffff, 1, 0, { map: baleTex, bumpMap: baleTex, bumpScale: 3, color: 0xd6bd80 }), 0.85, 0.21, 0.8);
+  bale.rotation.y = -0.35;
+  for (const dz of [-0.12, 0.12]) { const t = add(bale, new THREE.BoxGeometry(0.91, 0.43, 0.02), M(0x6b4a26, 1), 0, 0, dz); }
+  const smallPk = pumpkinTextures(false);
+  const spMat = M(0xffffff, 0.55, 0, { map: smallPk.color });
+  for (const [x, z, s] of [[-0.8, 0.9, 0.17], [-0.45, 1.1, 0.12], [0.9, 0.8 + 0.0, 0.14]]) {
+    const p = add(stage, pumpkinGeo(48), spMat, x, s * 0.82 + (x > 0.5 ? 0.42 : 0), z); p.scale.setScalar(s); p.rotation.y = rand(0, 6);
+    add(p, new THREE.CylinderGeometry(0.08, 0.12, 0.4, 6), stemMat, 0, 0.9, 0);
+  }
+
+  // soft-shadow spotlight just for this display
+  const spot = new THREE.SpotLight(0xffb070, 22, 9, 0.6, 0.6, 1.2);
+  spot.position.set(0.8, 4.0, 2.6); spot.target.position.set(0, 1.4, 0);
+  spot.castShadow = true; spot.shadow.mapSize.set(1024, 1024); spot.shadow.bias = -0.0008; spot.shadow.radius = 4;
+  stage.add(spot, spot.target);
+  stage.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  if (stage.parent) stage.parent.traverse(o => { if (o.isMesh) o.receiveShadow = true; });
+
+  let crowBob = 0;
   return {
-    eyes: [glow], eyeColor: new THREE.Color(0xffb000),
-    update(t, k, a) {
+    eyes: [], eyeColor: new THREE.Color(0xffb000),
+    update(t, k, a, dt) {
       const spin = a >= 0 ? smooth((a - 0.4) / 2.2) * PI * 2 : 0;
-      head.rotation.y = spin + Math.sin(t * 0.7) * 0.2 * (1 - k);
-      head.rotation.z = Math.sin(t * 23) * 0.1 * k;
-      head.position.y = 2.38 + 0.15 * k;
-      for (const [i, arm] of arms.entries()) arm.rotation.x = Math.sin(t * 25 + i * 2) * 0.35 * k;
-      body.rotation.y = Math.sin(t * 17) * 0.06 * k;
-      inner.intensity = (0.6 + 6 * k) * (0.8 + 0.2 * Math.sin(t * 30));
-      glow.color.setRGB(1, 0.55 + 0.4 * k * Math.random(), 0.1 * k);
-    }
+      headPivot.rotation.y = spin + Math.sin(t * 0.7) * 0.18 * (1 - k);
+      headPivot.rotation.z = Math.sin(t * 0.9) * 0.05 + Math.sin(t * 23) * 0.12 * k;
+      headPivot.rotation.x = 0.08 + Math.sin(t * 1.1) * 0.03;
+      head.position.y = 0.27 + 0.1 * k;
+      for (const [i, arm] of arms.entries()) arm.rotation.x = Math.sin(t * 25 + i * 2) * 0.3 * k + Math.sin(t * 0.8 + i) * 0.02;
+      for (const [i, L] of legs.entries()) L.rotation.x = Math.sin(t * 1.3 + i * 2) * 0.06 + Math.sin(t * 19 + i) * 0.25 * k;
+      body.rotation.y = Math.sin(t * 17) * 0.05 * k;
+      const fl = (0.85 + 0.15 * Math.sin(t * 13) * Math.sin(t * 7.3));
+      faceMat.emissiveIntensity = (1.1 + 1.4 * k) * fl * (k > 0 && Math.random() < 0.08 ? 0.3 : 1);
+      inner.intensity = (0.6 + 3 * k) * fl;
+      // crow: takes off when activated, circles, lands back
+      const fly = a >= 0 ? smooth((a - 0.15) / 0.5) * smooth((this.dur - 0.3 - a) / 1.2) : 0;
+      if (fly > 0.001) {
+        const ang = (a || 0) * 2.4;
+        C.crow.position.set(perch.x + Math.sin(ang) * 0.9 * fly + 0.3 * fly, perch.y + 1.0 * fly + Math.sin(ang * 2) * 0.1, perch.z + Math.cos(ang) * 0.6 * fly);
+        C.crow.rotation.y = 0.6 + ang * fly + PI / 2 * fly;
+        const flap = Math.sin(t * 38) * 0.9;
+        C.wings[0].rotation.z = flap; C.wings[1].rotation.z = -flap;
+        C.head.rotation.x = 0;
+      } else {
+        C.crow.position.copy(perch); C.crow.rotation.y = 0.6;
+        crowBob += dt;
+        const peck = Math.max(0, Math.sin(crowBob * 1.7)) ** 8;
+        C.head.rotation.x = peck * 0.7; C.head.rotation.y = Math.sin(crowBob * 0.6) * 0.6;
+        C.wings[0].rotation.z = 0.05; C.wings[1].rotation.z = -0.05;
+      }
+      C.ceye.color.setRGB(0.4 + 0.6 * k, 0.05, 0.05);
+    },
+    dur: 5.5
   };
 }
 // --- 6. Grave zombie ---
@@ -1073,8 +1351,8 @@ const CATALOG = [
     desc: '大鍋內魔藥冒泡發光,女巫越攪越快,仰頭狂笑。內建綠色 LED 與冒泡燈效。' },
   { id: 'wolf', cn: '突襲狼人', en: 'Lunging Werewolf', price: 329.99, height: '7 呎・高 213 cm', color: 0xffb000, sound: 'growl', dur: 5, build: buildWerewolf,
     desc: '低吼之後猛然向前撲擊、張口咆哮。全場最受歡迎的嚇人款,建議與膽小者保持距離。' },
-  { id: 'scare', cn: '南瓜稻草人', en: 'Pumpkin Stalker', price: 229.99, height: '6.5 呎・高 198 cm', color: 0xff7a00, sound: 'groan', dur: 5, build: buildScarecrow,
-    desc: '南瓜頭會整圈轉動,內部火光閃爍,稻草手臂抽搐,伴隨低沉呻吟與劈啪火聲。' },
+  { id: 'scare', cn: '南瓜稻草人', en: 'Pumpkin Stalker', price: 229.99, height: '6.5 呎・含烏鴉', color: 0xff7a00, sound: 'groan', dur: 5.5, build: buildScarecrow,
+    desc: '精緻版:手工雕刻南瓜頭會整圈轉動、內部火光閃爍,稻草手臂抽搐,肩上的烏鴉會飛起盤旋,伴隨低沉呻吟與劈啪火聲。' },
   { id: 'zombie', cn: '破土殭屍', en: 'Grave Riser', price: 199.99, height: '5.5 呎・含墓碑', color: 0x9cff3a, sound: 'moan', dur: 6, build: buildZombie, motion: true,
     desc: '動作感應:有人靠近時,殭屍從土堆中爬起,伸手抓向你並發出呻吟。' },
   { id: 'spider', cn: '巨型落蛛', en: 'Drop-Down Spider', price: 149.99, height: '腳展 2.4 m', color: 0xff1a1a, sound: 'hiss', dur: 5.5, build: buildSpider, motion: true,
@@ -1330,7 +1608,7 @@ function tick() {
       const flick = k > 0 ? (0.6 + 0.4 * Math.sin(t * 40 + f.seed) * (Math.random() < 0.3 ? -1 : 1)) : 1;
       f.light.intensity = 3 + 2 * Math.sin(t * 1.5 + f.seed) * 0.3 + 30 * k * flick;
       for (const e of f.fig.eyes) e.color.copy(f.fig.eyeColor).multiplyScalar(0.35 + 0.65 * Math.max(k, 0.25 + 0.15 * Math.sin(t * 2 + f.seed)));
-      if (f.btn) f.btn.capMat.emissiveIntensity = f.a >= 0 ? 0.2 : 0.6 + 0.6 * Math.sin(t * 5);
+      if (f.btn) f.btn.capMat.emissiveIntensity = f.a >= 0 ? 0.15 : 0.35 + 0.3 * Math.sin(t * 5);
       if (f.def.id === 'wolf' && f.a > 0.8 && f.a < 0.85 && Math.hypot(player.pos.x - f.front.x, player.pos.z - f.front.z) < 3.5) {
         shake = 0.7; scareEl.classList.add('on'); setTimeout(() => scareEl.classList.remove('on'), 160);
       }
@@ -1372,7 +1650,7 @@ function tick() {
 
     if (started) updateUI(dt);
   }
-  renderer.render(scene, camera);
+  composer.render();
 }
 tick();
 </script>
